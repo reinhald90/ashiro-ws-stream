@@ -4,9 +4,7 @@ import { WebSocketServer } from 'ws';
 import { URL } from 'url';
 
 /* ==========================================================
-   🎧 Ashiro WebSocket Stream Server (Vercel) v2
-   - Retry tanpa Range header kalau upstream gagal
-   - Fallback UA
+   🎧 Ashiro WebSocket Stream Server (Vercel Compatible) v2
    ========================================================== */
 
 const MAX_REDIRECTS = 5;
@@ -79,7 +77,6 @@ wss.on('connection', async (ws, req) => {
   }
 });
 
-/* ---- Retry wrapper: coba dgn Range dulu, kalau gagal tanpa Range ---- */
 async function streamWithRetry(audioUrl, ws, isAborted, setReq) {
   const attempts = [
     { headers: { 'Range': 'bytes=0-' }, label: 'Range' },
@@ -93,11 +90,10 @@ async function streamWithRetry(audioUrl, ws, isAborted, setReq) {
     try {
       console.log(`[WS] Attempt (${attempt.label}): ${audioUrl.slice(0, 80)}`);
       await streamAudio(audioUrl, ws, isAborted, 0, attempt.headers, setReq);
-      return; // sukses
+      return;
     } catch (e) {
       lastError = e;
       console.log(`[WS] Attempt (${attempt.label}) gagal: ${e.message}`);
-      // Kalau error bukan upstream HTTP 4xx/5xx, jangan retry
       if (!/Upstream HTTP/.test(e.message)) break;
     }
   }
@@ -123,7 +119,6 @@ async function streamAudio(audioUrl, ws, isAborted, redirects, extraHeaders, set
     let req;
     try {
       req = client.get(audioUrl, { headers, timeout: TIMEOUT_MS }, async (res) => {
-        // Handle redirect
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
           const nextUrl = new URL(res.headers.location, audioUrl).toString();
           console.log(`[WS] Redirect (${res.statusCode}) -> ${nextUrl.slice(0, 80)}`);
