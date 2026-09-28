@@ -1,9 +1,13 @@
+
 {
   "version": 2,
   "functions": {
     "api/ws.js": {
       "maxDuration": 300,
       "memory": 1024
+    },
+    "api/stream.js": {
+      "maxDuration": 300
     }
   },
   "rewrites": [
