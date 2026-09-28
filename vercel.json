@@ -2,7 +2,12 @@
   "version": 2,
   "functions": {
     "api/ws.js": {
-      "maxDuration": 300
+      "maxDuration": 300,
+      "memory": 1024
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/health", "destination": "/api/index" },
+    { "source": "/", "destination": "/api/index" }
+  ]
 }
