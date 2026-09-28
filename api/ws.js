@@ -4,18 +4,17 @@ import { WebSocketServer } from 'ws';
 import { URL } from 'url';
 
 /* ==========================================================
-   🎧 Ashiro WebSocket Stream Server (Vercel Compatible)
-   Menerima koneksi WS dengan parameter ?url=<audio_url>
-   dan streaming audio dari URL tersebut ke client.
+   🎧 Ashiro WebSocket Stream Server (Vercel) v2
+   - Retry tanpa Range header kalau upstream gagal
+   - Fallback UA
    ========================================================== */
 
 const MAX_REDIRECTS = 5;
-const TIMEOUT_MS = 120000; // 2 menit, aman di bawah batas Vercel
+const TIMEOUT_MS = 120000;
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -26,12 +25,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Health check endpoint
-  if (url.pathname === '/' || url.pathname === '/health') {
+  if (url.pathname === '/' || url.pathname === '/health' || url.pathname.startsWith('/api/ws')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: true,
-      message: 'Ashiro WebSocket Stream Server (Vercel)',
+      message: 'Ashiro WebSocket Stream Server v2'
     }));
     return;
   }
@@ -54,7 +52,7 @@ wss.on('connection', async (ws, req) => {
     return;
   }
 
-  console.log(`[WS] Streaming: ${audioUrl.slice(0, 100)}`);
+  console.log(`[WS] Streaming: ${audioUrl.slice(0, 120)}`);
 
   let aborted = false;
   let upstreamReq = null;
@@ -66,18 +64,11 @@ wss.on('connection', async (ws, req) => {
     }
   };
 
-  ws.on('close', () => {
-    console.log('[WS] Client disconnected.');
-    cleanup();
-  });
-
-  ws.on('error', (e) => {
-    console.error('[WS] Client error:', e.message);
-    cleanup();
-  });
+  ws.on('close', () => { console.log('[WS] Client disconnected.'); cleanup(); });
+  ws.on('error', (e) => { console.error('[WS] Client error:', e.message); cleanup(); });
 
   try {
-    await streamAudio(audioUrl, ws, () => aborted);
+    await streamWithRetry(audioUrl, ws, () => aborted, (r) => { upstreamReq = r; });
   } catch (e) {
     console.error('[WS] Stream error:', e.message);
     if (ws.readyState === ws.OPEN) {
@@ -88,31 +79,57 @@ wss.on('connection', async (ws, req) => {
   }
 });
 
-async function streamAudio(audioUrl, ws, isAborted, redirects = 0) {
+/* ---- Retry wrapper: coba dgn Range dulu, kalau gagal tanpa Range ---- */
+async function streamWithRetry(audioUrl, ws, isAborted, setReq) {
+  const attempts = [
+    { headers: { 'Range': 'bytes=0-' }, label: 'Range' },
+    { headers: {}, label: 'Plain' }
+  ];
+
+  let lastError = null;
+
+  for (const attempt of attempts) {
+    if (isAborted()) return;
+    try {
+      console.log(`[WS] Attempt (${attempt.label}): ${audioUrl.slice(0, 80)}`);
+      await streamAudio(audioUrl, ws, isAborted, 0, attempt.headers, setReq);
+      return; // sukses
+    } catch (e) {
+      lastError = e;
+      console.log(`[WS] Attempt (${attempt.label}) gagal: ${e.message}`);
+      // Kalau error bukan upstream HTTP 4xx/5xx, jangan retry
+      if (!/Upstream HTTP/.test(e.message)) break;
+    }
+  }
+
+  throw lastError || new Error('All attempts failed');
+}
+
+async function streamAudio(audioUrl, ws, isAborted, redirects, extraHeaders, setReq) {
   if (isAborted()) return;
   if (redirects > MAX_REDIRECTS) throw new Error('Too many redirects');
 
   return new Promise((resolve, reject) => {
     const client = audioUrl.startsWith('https') ? https : http;
-    let req;
 
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'audio/*,video/*,*/*;q=0.9',
+      'Accept-Encoding': 'identity',
+      'Accept-Language': 'en-US,en;q=0.9',
+      ...extraHeaders
+    };
+
+    let req;
     try {
-      req = client.get(audioUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'audio/*,*/*;q=0.9',
-          'Accept-Encoding': 'identity',
-          'Range': 'bytes=0-'
-        },
-        timeout: TIMEOUT_MS
-      }, async (res) => {
-        // Handle redirects
+      req = client.get(audioUrl, { headers, timeout: TIMEOUT_MS }, async (res) => {
+        // Handle redirect
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
           const nextUrl = new URL(res.headers.location, audioUrl).toString();
-          console.log(`[WS] Redirect (${res.statusCode}) → ${nextUrl.slice(0, 80)}`);
+          console.log(`[WS] Redirect (${res.statusCode}) -> ${nextUrl.slice(0, 80)}`);
           res.resume();
           try {
-            const result = await streamAudio(nextUrl, ws, isAborted, redirects + 1);
+            const result = await streamAudio(nextUrl, ws, isAborted, redirects + 1, extraHeaders, setReq);
             resolve(result);
           } catch (e) { reject(e); }
           return;
@@ -138,10 +155,7 @@ async function streamAudio(audioUrl, ws, isAborted, redirects = 0) {
 
         let bytes = 0;
         res.on('data', (chunk) => {
-          if (isAborted() || ws.readyState !== ws.OPEN) {
-            res.destroy();
-            return;
-          }
+          if (isAborted() || ws.readyState !== ws.OPEN) { res.destroy(); return; }
           try {
             ws.send(chunk, { binary: true });
             bytes += chunk.length;
@@ -161,22 +175,16 @@ async function streamAudio(audioUrl, ws, isAborted, redirects = 0) {
           resolve();
         });
 
-        res.on('error', (e) => {
-          console.error('[WS] Upstream error:', e.message);
-          reject(e);
-        });
+        res.on('error', (e) => { console.error('[WS] Upstream error:', e.message); reject(e); });
       });
 
+      setReq(req);
       req.on('error', (e) => reject(e));
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Upstream timeout'));
-      });
+      req.on('timeout', () => { req.destroy(); reject(new Error('Upstream timeout')); });
     } catch (e) {
       reject(e);
     }
   });
 }
 
-// Wajib: export server HTTP untuk Vercel
 export default server;
